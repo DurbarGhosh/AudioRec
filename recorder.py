@@ -20,22 +20,83 @@ class AudioRecorderApp(rumps.App):
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
 
         self.is_recording = False
-        self.audio_buffer = []
-        self.stream = None
+        self.buffers = {}
+        self.streams = {}
         self.playback_process = None
 
         self.start_stop_button = rumps.MenuItem(
             "Start Recording", callback=self.toggle_recording
         )
+        self.sources_submenu = rumps.MenuItem("Sources")
         self.recordings_submenu = rumps.MenuItem("Recordings")
+
+        self._selected_devices = self._load_selected_devices()
+        self._source_menu_items = {}
 
         self.menu = [
             self.start_stop_button,
+            self.sources_submenu,
             None,
             self.recordings_submenu,
         ]
 
+        self._build_sources_menu()
         self.refresh_recordings_list()
+
+    # ---- Device selection ----
+
+    def _gather_input_devices(self):
+        devices = []
+        for idx, dev in enumerate(sd.query_devices()):
+            if dev["max_input_channels"] > 0:
+                dev["_index"] = idx
+                devices.append(dev)
+        return devices
+
+    def _load_selected_devices(self):
+        return {sd.default.device[0]} if sd.default.device[0] is not None else set()
+
+    def _build_sources_menu(self):
+        self._source_menu_items.clear()
+        sm = self.sources_submenu
+        for key in list(sm.keys()):
+            del sm[key]
+
+        devices = self._gather_input_devices()
+        for dev in devices:
+            idx = dev["_index"]
+            label = f"✓ {dev['name']}" if idx in self._selected_devices else f"  {dev['name']}"
+            self._source_menu_items[idx] = rumps.MenuItem(
+                label,
+                callback=lambda sender, d=idx: self._toggle_source(d),
+            )
+            sm[str(idx)] = self._source_menu_items[idx]
+
+        sm[None] = None
+        sm["refresh_sources"] = rumps.MenuItem(
+            "Refresh Device List", callback=self._refresh_sources
+        )
+
+    def _toggle_source(self, device_id):
+        if device_id in self._selected_devices:
+            self._selected_devices.discard(device_id)
+        else:
+            self._selected_devices.add(device_id)
+
+        if not self._selected_devices:
+            default = sd.default.device[0]
+            if default is not None:
+                self._selected_devices.add(default)
+
+        for idx, item in self._source_menu_items.items():
+            dev_name = sd.query_devices(idx)["name"]
+            if idx in self._selected_devices:
+                item.title = f"✓ {dev_name}"
+            else:
+                item.title = f"  {dev_name}"
+
+    def _refresh_sources(self, _):
+        self._build_sources_menu()
 
     # ---- Recordings submenu ----
 
@@ -77,42 +138,81 @@ class AudioRecorderApp(rumps.App):
         else:
             self.start_recording()
 
-    def start_recording(self):
-        try:
-            self.audio_buffer = []
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                callback=self._audio_callback,
-                dtype="float32",
-            )
-            self.stream.start()
-            self.is_recording = True
-            self.title = "🔴"
-            self.start_stop_button.title = "Stop Recording"
-        except Exception as e:
-            rumps.notification("AudioRec", "Mic Error", str(e))
+    def _make_callback(self, device_id):
+        def callback(indata, frames, time, status):
+            if status:
+                rumps.notification("AudioRec", "Warning", str(status))
+            buf = self.buffers.setdefault(device_id, [])
+            buf.append(indata.copy())
+        return callback
 
-    def _audio_callback(self, indata, frames, time, status):
-        if status:
-            rumps.notification("AudioRec", "Warning", str(status))
-        self.audio_buffer.append(indata.copy())
+    def start_recording(self):
+        if not self._selected_devices:
+            rumps.notification("AudioRec", "No Source", "Select a device in Sources")
+            return
+
+        self.buffers = {}
+        self.streams = {}
+        errors = []
+
+        for device_id in self._selected_devices:
+            try:
+                dev_info = sd.query_devices(device_id)
+                ch = min(dev_info["max_input_channels"], CHANNELS)
+                stream = sd.InputStream(
+                    device=device_id,
+                    samplerate=SAMPLE_RATE,
+                    channels=ch,
+                    callback=self._make_callback(device_id),
+                    dtype="float32",
+                )
+                stream.start()
+                self.streams[device_id] = stream
+            except Exception as e:
+                errors.append(f"{dev_info['name']}: {e}")
+
+        if not self.streams:
+            rumps.notification("AudioRec", "Error", "; ".join(errors))
+            return
+
+        if errors:
+            rumps.notification("AudioRec", "Partial Start", "; ".join(errors))
+
+        self.is_recording = True
+        self.title = "🔴"
+        self.start_stop_button.title = "Stop Recording"
 
     def stop_recording(self):
         self.is_recording = False
         self.title = "⏺"
         self.start_stop_button.title = "Start Recording"
 
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        for stream in self.streams.values():
+            stream.stop()
+            stream.close()
+        self.streams.clear()
 
-        if not self.audio_buffer:
+        if not self.buffers:
+            self.buffers.clear()
             return
 
-        audio_data = np.concatenate(self.audio_buffer, axis=0)
-        self.audio_buffer = []
+        mixes = []
+        for device_id, chunks in self.buffers.items():
+            mixes.append(np.concatenate(chunks, axis=0))
+        self.buffers.clear()
+
+        max_len = max(m.shape[0] for m in mixes)
+        padded = []
+        for m in mixes:
+            if m.shape[0] < max_len:
+                p = np.zeros((max_len, m.shape[1]), dtype=np.float32)
+                p[: m.shape[0]] = m
+                padded.append(p)
+            else:
+                padded.append(m)
+
+        audio_data = sum(padded) / len(padded)
+        audio_data = np.clip(audio_data, -1.0, 1.0)
 
         filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".wav"
         filepath = self.recordings_dir / filename
