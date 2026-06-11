@@ -1,0 +1,13 @@
+build/
+__pycache__/
+*.pyc
+*.spec
+.DS_Store
+Resources/
+Frameworks/
+*.egg-info/
+
+log.md
+devlog.md
+guide.md
+.commandcode/
