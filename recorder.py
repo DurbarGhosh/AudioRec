@@ -12,6 +12,16 @@ RECORDINGS_DIR = Path.home() / "AudioRec"
 SAMPLE_RATE = 44100
 CHANNELS = 1
 
+MIC_KEYWORDS = []
+SYSTEM_AUDIO_KEYWORDS = ["blackhole", "loopback", "soundflower", "virtual", "aggregate"]
+
+
+def _classify_device(dev):
+    name = dev["name"].lower()
+    if any(kw in name for kw in SYSTEM_AUDIO_KEYWORDS):
+        return "system"
+    return "mic"
+
 
 class AudioRecorderApp(rumps.App):
     def __init__(self):
@@ -24,79 +34,116 @@ class AudioRecorderApp(rumps.App):
         self.streams = {}
         self.playback_process = None
 
+        self._devices = self._gather_input_devices()
+        self._mic_devices = [d for d in self._devices if d["_kind"] == "mic"]
+        self._system_devices = [d for d in self._devices if d["_kind"] == "system"]
+
+        self.mode = "mic"
+        self.selected_mic = sd.default.device[0] if sd.default.device[0] in {d["_index"] for d in self._mic_devices} else (self._mic_devices[0]["_index"] if self._mic_devices else None)
+        self.selected_system = self._system_devices[0]["_index"] if self._system_devices else None
+
         self.start_stop_button = rumps.MenuItem(
             "Start Recording", callback=self.toggle_recording
         )
-        self.sources_submenu = rumps.MenuItem("Sources")
+        self.mode_submenu = rumps.MenuItem("Mode")
+        self.mic_submenu = rumps.MenuItem("Mic")
+        self.system_submenu = rumps.MenuItem("Internal Audio")
         self.recordings_submenu = rumps.MenuItem("Recordings")
-
-        self._selected_devices = self._load_selected_devices()
-        self._source_menu_items = {}
 
         self.menu = [
             self.start_stop_button,
-            self.sources_submenu,
+            self.mode_submenu,
+            self.mic_submenu,
+            self.system_submenu,
             None,
             self.recordings_submenu,
         ]
 
-        self._build_sources_menu()
+        self._build_mode_menu()
+        self._build_mic_menu()
+        self._build_system_menu()
         self.refresh_recordings_list()
 
-    # ---- Device selection ----
+    # ---- Device discovery ----
 
     def _gather_input_devices(self):
         devices = []
         for idx, dev in enumerate(sd.query_devices()):
             if dev["max_input_channels"] > 0:
                 dev["_index"] = idx
+                dev["_kind"] = _classify_device(dev)
                 devices.append(dev)
         return devices
 
-    def _load_selected_devices(self):
-        return {sd.default.device[0]} if sd.default.device[0] is not None else set()
+    # ---- Mode menu ----
 
-    def _build_sources_menu(self):
-        self._source_menu_items.clear()
-        sm = self.sources_submenu
+    def _build_mode_menu(self):
+        sm = self.mode_submenu
         for key in list(sm.keys()):
             del sm[key]
 
-        devices = self._gather_input_devices()
-        for dev in devices:
-            idx = dev["_index"]
-            label = f"✓ {dev['name']}" if idx in self._selected_devices else f"  {dev['name']}"
-            self._source_menu_items[idx] = rumps.MenuItem(
-                label,
-                callback=lambda sender, d=idx: self._toggle_source(d),
+        modes = [
+            ("mic", "Mic Only"),
+            ("system", "Internal Audio Only"),
+            ("both_mix", "Both (Mixed)"),
+            ("both_separate", "Both (Separate Files)"),
+        ]
+        for mode, label in modes:
+            prefix = "✓" if self.mode == mode else " "
+            sm[mode] = rumps.MenuItem(
+                f"{prefix} {label}",
+                callback=lambda sender, m=mode: self._set_mode(m),
             )
-            sm[str(idx)] = self._source_menu_items[idx]
 
-        sm[None] = None
-        sm["refresh_sources"] = rumps.MenuItem(
-            "Refresh Device List", callback=self._refresh_sources
-        )
+    def _set_mode(self, mode):
+        self.mode = mode
+        self._build_mode_menu()
 
-    def _toggle_source(self, device_id):
-        if device_id in self._selected_devices:
-            self._selected_devices.discard(device_id)
-        else:
-            self._selected_devices.add(device_id)
+    # ---- Mic menu ----
 
-        if not self._selected_devices:
-            default = sd.default.device[0]
-            if default is not None:
-                self._selected_devices.add(default)
+    def _build_mic_menu(self):
+        sm = self.mic_submenu
+        for key in list(sm.keys()):
+            del sm[key]
 
-        for idx, item in self._source_menu_items.items():
-            dev_name = sd.query_devices(idx)["name"]
-            if idx in self._selected_devices:
-                item.title = f"✓ {dev_name}"
-            else:
-                item.title = f"  {dev_name}"
+        if not self._mic_devices:
+            sm["_none"] = rumps.MenuItem("(no mics found)")
+            return
 
-    def _refresh_sources(self, _):
-        self._build_sources_menu()
+        for d in self._mic_devices:
+            idx = d["_index"]
+            prefix = "✓" if idx == self.selected_mic else " "
+            sm[str(idx)] = rumps.MenuItem(
+                f"{prefix} {d['name']}",
+                callback=lambda sender, did=idx: self._set_mic(did),
+            )
+
+    def _set_mic(self, device_id):
+        self.selected_mic = device_id
+        self._build_mic_menu()
+
+    # ---- System audio menu ----
+
+    def _build_system_menu(self):
+        sm = self.system_submenu
+        for key in list(sm.keys()):
+            del sm[key]
+
+        if not self._system_devices:
+            sm["_none"] = rumps.MenuItem("(none — install BlackHole)")
+            return
+
+        for d in self._system_devices:
+            idx = d["_index"]
+            prefix = "✓" if idx == self.selected_system else " "
+            sm[str(idx)] = rumps.MenuItem(
+                f"{prefix} {d['name']}",
+                callback=lambda sender, did=idx: self._set_system(did),
+            )
+
+    def _set_system(self, device_id):
+        self.selected_system = device_id
+        self._build_system_menu()
 
     # ---- Recordings submenu ----
 
@@ -130,6 +177,16 @@ class AudioRecorderApp(rumps.App):
             "Stop Playback", callback=self.stop_playback
         )
 
+    # ---- Device selection helpers ----
+
+    def _active_sources(self):
+        sources = {}
+        if self.mode in ("mic", "both_mix", "both_separate") and self.selected_mic is not None:
+            sources["mic"] = self.selected_mic
+        if self.mode in ("system", "both_mix", "both_separate") and self.selected_system is not None:
+            sources["system"] = self.selected_system
+        return sources
+
     # ---- Recording ----
 
     def toggle_recording(self, _):
@@ -138,24 +195,17 @@ class AudioRecorderApp(rumps.App):
         else:
             self.start_recording()
 
-    def _make_callback(self, device_id):
-        def callback(indata, frames, time, status):
-            if status:
-                rumps.notification("AudioRec", "Warning", str(status))
-            buf = self.buffers.setdefault(device_id, [])
-            buf.append(indata.copy())
-        return callback
-
     def start_recording(self):
-        if not self._selected_devices:
-            rumps.notification("AudioRec", "No Source", "Select a device in Sources")
+        sources = self._active_sources()
+        if not sources:
+            rumps.notification("AudioRec", "No Source", "Select mic/internal in the menu")
             return
 
         self.buffers = {}
         self.streams = {}
         errors = []
 
-        for device_id in self._selected_devices:
+        for label, device_id in sources.items():
             try:
                 dev_info = sd.query_devices(device_id)
                 ch = min(dev_info["max_input_channels"], CHANNELS)
@@ -163,11 +213,11 @@ class AudioRecorderApp(rumps.App):
                     device=device_id,
                     samplerate=SAMPLE_RATE,
                     channels=ch,
-                    callback=self._make_callback(device_id),
+                    callback=self._make_callback(label),
                     dtype="float32",
                 )
                 stream.start()
-                self.streams[device_id] = stream
+                self.streams[label] = stream
             except Exception as e:
                 errors.append(f"{dev_info['name']}: {e}")
 
@@ -181,6 +231,14 @@ class AudioRecorderApp(rumps.App):
         self.is_recording = True
         self.title = "🔴"
         self.start_stop_button.title = "Stop Recording"
+
+    def _make_callback(self, label):
+        def callback(indata, frames, time, status):
+            if status:
+                rumps.notification("AudioRec", "Warning", str(status))
+            buf = self.buffers.setdefault(label, [])
+            buf.append(indata.copy())
+        return callback
 
     def stop_recording(self):
         self.is_recording = False
@@ -196,31 +254,43 @@ class AudioRecorderApp(rumps.App):
             self.buffers.clear()
             return
 
-        mixes = []
-        for device_id, chunks in self.buffers.items():
-            mixes.append(np.concatenate(chunks, axis=0))
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        saved = []
+
+        if self.mode == "both_separate" and len(self.buffers) > 1:
+            for label, chunks in self.buffers.items():
+                audio_data = np.concatenate(chunks, axis=0)
+                audio_data = np.clip(audio_data, -1.0, 1.0)
+                filename = f"{timestamp}_{label}.wav"
+                filepath = self.recordings_dir / filename
+                sf.write(str(filepath), audio_data, SAMPLE_RATE)
+                saved.append(filename)
+        else:
+            mixes = []
+            for chunks in self.buffers.values():
+                mixes.append(np.concatenate(chunks, axis=0))
+
+            max_len = max(m.shape[0] for m in mixes)
+            padded = []
+            for m in mixes:
+                if m.shape[0] < max_len:
+                    p = np.zeros((max_len, m.shape[1]), dtype=np.float32)
+                    p[: m.shape[0]] = m
+                    padded.append(p)
+                else:
+                    padded.append(m)
+
+            audio_data = sum(padded) / len(padded)
+            audio_data = np.clip(audio_data, -1.0, 1.0)
+
+            filename = f"{timestamp}.wav"
+            filepath = self.recordings_dir / filename
+            sf.write(str(filepath), audio_data, SAMPLE_RATE)
+            saved.append(filename)
+
         self.buffers.clear()
-
-        max_len = max(m.shape[0] for m in mixes)
-        padded = []
-        for m in mixes:
-            if m.shape[0] < max_len:
-                p = np.zeros((max_len, m.shape[1]), dtype=np.float32)
-                p[: m.shape[0]] = m
-                padded.append(p)
-            else:
-                padded.append(m)
-
-        audio_data = sum(padded) / len(padded)
-        audio_data = np.clip(audio_data, -1.0, 1.0)
-
-        filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".wav"
-        filepath = self.recordings_dir / filename
-
-        sf.write(str(filepath), audio_data, SAMPLE_RATE)
-
         self.refresh_recordings_list()
-        rumps.notification("AudioRec", "Saved", filename)
+        rumps.notification("AudioRec", "Saved", ", ".join(saved))
 
     # ---- Playback ----
 
