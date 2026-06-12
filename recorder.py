@@ -74,6 +74,7 @@ class AudioRecorderApp(rumps.App):
         self.pause_resume_button = rumps.MenuItem(
             "Pause", callback=self.toggle_pause
         )
+        self.pause_resume_button.hide()
         self.mode_submenu = rumps.MenuItem("Mode")
         self.mic_submenu = rumps.MenuItem("Mic")
         self.system_submenu = rumps.MenuItem("Internal Audio")
@@ -98,8 +99,12 @@ class AudioRecorderApp(rumps.App):
 
     def _set_status_icon(self, nsimage):
         self._icon_nsimage = nsimage
+        if nsimage is not None:
+            self._title = None
         if hasattr(self, '_nsapp'):
             self._nsapp.setStatusBarIcon()
+            if nsimage is not None:
+                self._nsapp.setStatusBarTitle()
 
     # ---- Device discovery ----
 
@@ -293,6 +298,7 @@ class AudioRecorderApp(rumps.App):
         self._set_status_icon(self._recording_icon)
         self.start_stop_button.title = "Stop Recording"
         self.pause_resume_button.title = "Pause"
+        self.pause_resume_button.show()
 
     def _make_callback(self, label):
         def callback(indata, frames, time, status):
