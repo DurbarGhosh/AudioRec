@@ -3,12 +3,13 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+import AppKit
 import numpy as np
 import rumps
 import sounddevice as sd
 import soundfile as sf
 
-RECORDINGS_DIR = Path.home() / "AudioRec"
+RECORDINGS_DIR = Path.home() / "Music" / "AudioRec"
 SAMPLE_RATE = 44100
 CHANNELS = 1
 
@@ -23,13 +24,38 @@ def _classify_device(dev):
     return "mic"
 
 
+def _make_circle_icon(size=16, color=None):
+    """Return an NSImage of a filled circle.
+
+    If color is None, creates a template image (adapts to dark/light mode).
+    If color is an (r,g,b,a) tuple, fills with that exact color.
+    """
+    image = AppKit.NSImage.alloc().initWithSize_((size, size))
+    image.lockFocus()
+    rect = AppKit.NSMakeRect(0, 0, size, size)
+    path = AppKit.NSBezierPath.bezierPathWithOvalInRect_(rect)
+    if color is None:
+        AppKit.NSColor.blackColor().set()
+        path.fill()
+        image.setTemplate_(True)
+    else:
+        AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(*color).set()
+        path.fill()
+    image.unlockFocus()
+    return image
+
+
 class AudioRecorderApp(rumps.App):
     def __init__(self):
-        super().__init__("⏺", title=None, quit_button="Quit AudioRec")
+        super().__init__("", title=None, quit_button="Quit AudioRec")
+        self._idle_icon = _make_circle_icon(size=9)
+        self._recording_icon = _make_circle_icon(size=9, color=(1.0, 0.2, 0.2, 1.0))
+        self._set_status_icon(self._idle_icon)
         self.recordings_dir = RECORDINGS_DIR
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
 
         self.is_recording = False
+        self.is_paused = False
         self.buffers = {}
         self.streams = {}
         self.playback_process = None
@@ -45,6 +71,9 @@ class AudioRecorderApp(rumps.App):
         self.start_stop_button = rumps.MenuItem(
             "Start Recording", callback=self.toggle_recording
         )
+        self.pause_resume_button = rumps.MenuItem(
+            "Pause", callback=self.toggle_pause
+        )
         self.mode_submenu = rumps.MenuItem("Mode")
         self.mic_submenu = rumps.MenuItem("Mic")
         self.system_submenu = rumps.MenuItem("Internal Audio")
@@ -52,6 +81,7 @@ class AudioRecorderApp(rumps.App):
 
         self.menu = [
             self.start_stop_button,
+            self.pause_resume_button,
             self.mode_submenu,
             self.mic_submenu,
             self.system_submenu,
@@ -63,6 +93,13 @@ class AudioRecorderApp(rumps.App):
         self._build_mic_menu()
         self._build_system_menu()
         self.refresh_recordings_list()
+
+    # ---- Icon management ----
+
+    def _set_status_icon(self, nsimage):
+        self._icon_nsimage = nsimage
+        if hasattr(self, '_nsapp'):
+            self._nsapp.setStatusBarIcon()
 
     # ---- Device discovery ----
 
@@ -195,6 +232,29 @@ class AudioRecorderApp(rumps.App):
         else:
             self.start_recording()
 
+    def toggle_pause(self, _):
+        if not self.is_recording:
+            return
+        if self.is_paused:
+            self._resume_recording()
+        else:
+            self._pause_recording()
+
+    def _pause_recording(self):
+        for stream in self.streams.values():
+            stream.stop()
+        self.is_paused = True
+        self._set_status_icon(None)
+        self.title = "⏸"
+        self.pause_resume_button.title = "Resume"
+
+    def _resume_recording(self):
+        for stream in self.streams.values():
+            stream.start()
+        self.is_paused = False
+        self._set_status_icon(self._recording_icon)
+        self.pause_resume_button.title = "Pause"
+
     def start_recording(self):
         sources = self._active_sources()
         if not sources:
@@ -229,8 +289,10 @@ class AudioRecorderApp(rumps.App):
             rumps.notification("AudioRec", "Partial Start", "; ".join(errors))
 
         self.is_recording = True
-        self.title = "🔴"
+        self.is_paused = False
+        self._set_status_icon(self._recording_icon)
         self.start_stop_button.title = "Stop Recording"
+        self.pause_resume_button.title = "Pause"
 
     def _make_callback(self, label):
         def callback(indata, frames, time, status):
@@ -242,8 +304,10 @@ class AudioRecorderApp(rumps.App):
 
     def stop_recording(self):
         self.is_recording = False
-        self.title = "⏺"
+        self.is_paused = False
+        self._set_status_icon(self._idle_icon)
         self.start_stop_button.title = "Start Recording"
+        self.pause_resume_button.title = "Pause"
 
         for stream in self.streams.values():
             stream.stop()
